@@ -1,19 +1,25 @@
 from __future__ import annotations
 
+import argparse
 import math
+import os
 import random
-import sys
+import time
 from dataclasses import dataclass
 from enum import Enum, auto
 
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+
 import psutil
 import pygame
+import torch
 
 from src.model import (
     ALLY_SLOTS,
     ENEMY_SLOTS,
     OBSERVATION_DIM,
     PER_AGENT_FEATURES,
+    PolicyAction,
     RAY_COUNT,
     CombatPolicyNet,
 )
@@ -26,6 +32,7 @@ WIN_W, WIN_H = 1280, 900
 WALL_T = 50
 FPS_CAP = 60
 PHYSICS_STEP = 1 / 120
+PHYSICS_HZ = round(1 / PHYSICS_STEP)
 MAX_FRAME_TIME = 0.25
 
 # =============================================================================
@@ -83,7 +90,7 @@ MODE_HUMAN_VS_AI = "human_vs_ai"
 MODE_AI_VS_AI = "ai_vs_ai"
 AI_ROUND_SECONDS = 45.0
 NO_COMBAT_TIMEOUT = 8.0
-AGENT_COLLISION_ITERATIONS = 4
+AGENT_COLLISION_ITERATIONS = 6
 ENGAGEMENT_REWARD_RANGE = 250.0
 ENGAGEMENT_DISTANCE_REWARD_RATE = 0.18
 ENGAGEMENT_FACING_REWARD_RATE = 0.03
@@ -110,6 +117,10 @@ AI_TEAM_SETUPS = (
 # =============================================================================
 # Compute tuning
 # =============================================================================
+AI_DECISION_HZ = 30
+AI_DECISION_STEPS = max(1, round(PHYSICS_HZ / AI_DECISION_HZ))
+AI_ATTACK_THRESHOLD = 0.52
+AI_PARRY_THRESHOLD = 0.68
 FAST_FORWARD_STEPS_PER_FRAME = 300
 FAST_FORWARD_FPS_CAP = 10
 CPU_THROTTLE_LIMIT = 75       # percent; pause simulation above this
@@ -332,12 +343,12 @@ class Agent:
 
         self.hit_flash_timer: float = 0.0
         self.heal_particles: list[HealParticle] = []
-        self.damage_dealt: int = 0
-        self.damage_taken: int = 0
+        self.damage_dealt: float = 0.0
+        self.damage_taken: float = 0.0
         self.kills: int = 0
         self.deaths: int = 0
         self.death_heal_received: float = 0.0
-        self.damage_sources: dict[Agent, int] = {}
+        self.damage_sources: dict[Agent, float] = {}
         self.hits_landed: int = 0
         self.swings_started: int = 0
         self.parries_started: int = 0
@@ -516,17 +527,24 @@ class Agent:
         if self.parry_state == ParryState.WEAKNESS:
             terminal_speed *= PARRY_WEAKNESS_SPEED_SCALE
 
-        if direction.length_squared() > 0:
-            input_accel = direction.normalize() * terminal_speed * AGENT_DRAG
+        direction_len_sq = direction.length_squared()
+        if direction_len_sq > 0:
+            target_vel = direction.normalize() * terminal_speed
         else:
-            input_accel = pygame.Vector2(0, 0)
+            target_vel = pygame.Vector2(0, 0)
 
-        self.vel += (input_accel - self.vel * AGENT_DRAG) * dt
+        if AGENT_DRAG > 0.0:
+            old_vel = pygame.Vector2(self.vel)
+            decay = math.exp(-AGENT_DRAG * dt)
+            self.vel = target_vel + (old_vel - target_vel) * decay
+            self.pos += target_vel * dt + (old_vel - target_vel) * ((1.0 - decay) / AGENT_DRAG)
+        else:
+            self.vel = pygame.Vector2(target_vel)
+            self.pos += self.vel * dt
 
-        if direction.length_squared() == 0 and self.vel.length_squared() < AGENT_STOP_SPEED ** 2:
+        if direction_len_sq == 0 and self.vel.length_squared() < AGENT_STOP_SPEED ** 2:
             self.vel.update(0, 0)
 
-        self.pos += self.vel * dt
         arena.clamp_circle(self.pos, self.vel, AGENT_RADIUS)
 
     # -------------------------------------------------------------------------
@@ -927,6 +945,18 @@ def build_observation(agent: Agent, agents: list[Agent], arena: Arena) -> list[f
     return features[:OBSERVATION_DIM]
 
 
+NEUTRAL_POLICY_ACTION = PolicyAction(
+    move_x=0.0,
+    move_y=0.0,
+    aim_x=0.0,
+    aim_y=0.0,
+    attack=False,
+    parry=False,
+    attack_score=0.0,
+    parry_score=0.0,
+)
+
+
 class NeuralAgent(Agent):
     def __init__(
         self,
@@ -944,12 +974,16 @@ class NeuralAgent(Agent):
         self.body_color = _team_color(team_id)
         self.edge_color = _team_edge_color(team_id)
         self.fist_color = _team_fist_color(team_id)
+        self.policy_action = NEUTRAL_POLICY_ACTION
+
+    def set_policy_action(self, action: PolicyAction) -> None:
+        self.policy_action = action
 
     def update(self, dt: float, arena: Arena, agents: list[Agent]) -> None:
         if not self.is_alive():
             return
 
-        action = self.policy.act(build_observation(self, agents, arena))
+        action = self.policy_action
         nearest_enemy = _nearest_enemy(self, agents)
         decision_angle = self.look_angle
 
@@ -985,6 +1019,64 @@ class NeuralAgent(Agent):
         self._tick_heal_particles(dt)
 
 
+def _actions_from_policy_output(output: torch.Tensor) -> list[PolicyAction]:
+    if output.ndim == 1:
+        output = output.unsqueeze(0)
+
+    move = torch.tanh(output[:, 0:2]).cpu()
+    aim = torch.tanh(output[:, 2:4]).cpu()
+    attack_scores = torch.sigmoid(output[:, 4]).cpu()
+    parry_scores = torch.sigmoid(output[:, 5]).cpu()
+
+    actions: list[PolicyAction] = []
+    for index in range(output.shape[0]):
+        attack_score = float(attack_scores[index].item())
+        parry_score = float(parry_scores[index].item())
+        actions.append(
+            PolicyAction(
+                move_x=float(move[index, 0].item()),
+                move_y=float(move[index, 1].item()),
+                aim_x=float(aim[index, 0].item()),
+                aim_y=float(aim[index, 1].item()),
+                attack=attack_score >= AI_ATTACK_THRESHOLD,
+                parry=parry_score >= AI_PARRY_THRESHOLD,
+                attack_score=attack_score,
+                parry_score=parry_score,
+            )
+        )
+    return actions
+
+
+def _refresh_neural_policy_actions(agents: list[Agent], arena: Arena) -> tuple[int, int]:
+    policy_groups: dict[int, tuple[CombatPolicyNet, list[NeuralAgent], list[list[float]]]] = {}
+
+    for agent in agents:
+        if not isinstance(agent, NeuralAgent) or not agent.is_alive():
+            continue
+
+        key = id(agent.policy)
+        if key not in policy_groups:
+            policy_groups[key] = (agent.policy, [], [])
+        _, group_agents, observations = policy_groups[key]
+        group_agents.append(agent)
+        observations.append(build_observation(agent, agents, arena))
+
+    decision_count = 0
+    for policy, group_agents, observations in policy_groups.values():
+        if not observations:
+            continue
+
+        obs_tensor = torch.tensor(observations, dtype=torch.float32)
+        with torch.inference_mode():
+            actions = _actions_from_policy_output(policy(obs_tensor))
+
+        for agent, action in zip(group_agents, actions):
+            agent.set_policy_action(action)
+        decision_count += len(group_agents)
+
+    return decision_count, len(policy_groups)
+
+
 # =============================================================================
 # Combat resolution
 # =============================================================================
@@ -1007,93 +1099,202 @@ def _distribute_death_heal(defender: Agent) -> None:
         source.spawn_heal_effect(actual_heal)
 
 
-def _resolve_combat(attacker: Agent, defender: Agent) -> str | None:
-    if not attacker.is_alive() or not defender.is_alive():
-        return None
-
-    if attacker.team_id is not None and attacker.team_id == defender.team_id:
-        return None
-
-    hpos = attacker.hitbox_position()
-    dist = (defender.pos - hpos).length()
-    if dist > HITBOX_RADIUS + AGENT_RADIUS:
-        return None
-
-    if defender.is_parrying():
-        attacker.apply_stun()
-        defender.clear_parry_weakness()
-        defender.parries_landed += 1
-        attacker.times_parried += 1
-        return "parried"
-    else:
-        prev_hp = defender.hp
-        defender.hp = max(0, defender.hp - MELEE_DAMAGE)
-        defender.hit_flash_timer = HIT_FLASH_DURATION
-        damage = prev_hp - defender.hp
-        attacker.damage_dealt += damage
-        defender.damage_taken += damage
-        defender.damage_sources[attacker] = defender.damage_sources.get(attacker, 0) + damage
-        attacker.hits_landed += 1
-        if prev_hp > 0 and defender.hp <= 0:
-            attacker.kills += 1
-            defender.deaths += 1
-            _distribute_death_heal(defender)
-        return "hit"
+@dataclass(frozen=True)
+class AttackPlan:
+    attacker: Agent
+    parried_by: Agent | None
+    defenders: tuple[Agent, ...]
 
 
-def _resolve_attack(attacker: Agent, agents: list[Agent]) -> None:
-    if not attacker.is_alive():
-        return
+def _can_attack_target(attacker: Agent, defender: Agent) -> bool:
+    return (
+        defender is not attacker
+        and defender.is_alive()
+        and not (
+            attacker.team_id is not None
+            and attacker.team_id == defender.team_id
+        )
+    )
+
+
+def _build_attack_plan(attacker: Agent, agents: list[Agent]) -> AttackPlan:
+    hitbox_pos = attacker.hitbox_position()
+    hit_range_sq = (HITBOX_RADIUS + AGENT_RADIUS) ** 2
+    parry_targets: list[Agent] = []
+    hit_targets: list[Agent] = []
 
     for defender in agents:
-        if defender is attacker:
+        if not _can_attack_target(attacker, defender):
             continue
-        result = _resolve_combat(attacker, defender)
-        if result == "parried":
-            break
+        if (defender.pos - hitbox_pos).length_squared() > hit_range_sq:
+            continue
+        if defender.is_parrying():
+            parry_targets.append(defender)
+        else:
+            hit_targets.append(defender)
+
+    if parry_targets:
+        parried_by = min(
+            parry_targets,
+            key=lambda defender: (defender.pos - hitbox_pos).length_squared(),
+        )
+        return AttackPlan(attacker, parried_by, ())
+
+    return AttackPlan(attacker, None, tuple(hit_targets))
+
+
+def _kill_credit_source(
+    defender: Agent,
+    attackers: list[Agent],
+    agent_order: dict[Agent, int],
+) -> Agent:
+    return max(
+        attackers,
+        key=lambda attacker: (
+            defender.damage_sources.get(attacker, 0.0),
+            -agent_order.get(attacker, 0),
+        ),
+    )
+
+
+def _apply_attack_plans(plans: list[AttackPlan], agents: list[Agent]) -> bool:
+    agent_order = {agent: index for index, agent in enumerate(agents)}
+    hits_by_defender: dict[Agent, list[Agent]] = {}
+
+    for plan in plans:
+        if plan.parried_by is None:
+            for defender in plan.defenders:
+                hits_by_defender.setdefault(defender, []).append(plan.attacker)
+            continue
+
+        plan.attacker.apply_stun()
+        plan.parried_by.clear_parry_weakness()
+        plan.parried_by.parries_landed += 1
+        plan.attacker.times_parried += 1
+
+    any_damage = False
+    defeated_defenders: list[tuple[Agent, list[Agent]]] = []
+    for defender, attackers in hits_by_defender.items():
+        if not defender.is_alive() or not attackers:
+            continue
+
+        hp_before = defender.hp
+        nominal_damage = MELEE_DAMAGE * len(attackers)
+        actual_damage = min(hp_before, nominal_damage)
+        if actual_damage <= 0:
+            continue
+
+        credit_per_hit = actual_damage / len(attackers)
+        defender.hp = max(0, hp_before - nominal_damage)
+        defender.hit_flash_timer = HIT_FLASH_DURATION
+        defender.damage_taken += actual_damage
+        for attacker in attackers:
+            attacker.damage_dealt += credit_per_hit
+            attacker.hits_landed += 1
+            defender.damage_sources[attacker] = (
+                defender.damage_sources.get(attacker, 0.0) + credit_per_hit
+            )
+
+        any_damage = True
+        if hp_before > 0 and defender.hp <= 0:
+            defeated_defenders.append((defender, attackers))
+
+    for defender, attackers in defeated_defenders:
+        killer = _kill_credit_source(defender, attackers, agent_order)
+        killer.kills += 1
+        defender.deaths += 1
+        _distribute_death_heal(defender)
+
+    return any_damage
+
+
+def _resolve_pending_attacks(agents: list[Agent]) -> bool:
+    attackers = [
+        agent for agent in agents
+        if agent.is_alive() and agent._fire_hitbox
+    ]
+    plans = [_build_attack_plan(attacker, agents) for attacker in attackers]
+
+    for agent in agents:
+        agent._fire_hitbox = False
+
+    return _apply_attack_plans(plans, agents)
+
+
+def _collision_candidate_pairs(agents: list[Agent], cell_size: float) -> list[tuple[int, int]]:
+    grid: dict[tuple[int, int], list[int]] = {}
+    for index, agent in enumerate(agents):
+        if not agent.is_alive():
+            continue
+        cell = (
+            math.floor(agent.pos.x / cell_size),
+            math.floor(agent.pos.y / cell_size),
+        )
+        grid.setdefault(cell, []).append(index)
+
+    pairs: set[tuple[int, int]] = set()
+    for cell in sorted(grid):
+        cx, cy = cell
+        for ox in (-1, 0, 1):
+            for oy in (-1, 0, 1):
+                neighbor = (cx + ox, cy + oy)
+                if neighbor not in grid:
+                    continue
+                for i in grid[cell]:
+                    for j in grid[neighbor]:
+                        if i < j:
+                            pairs.add((i, j))
+
+    return sorted(pairs)
 
 
 def _resolve_agent_collisions(arena: Arena, agents: list[Agent]) -> None:
     min_dist = AGENT_RADIUS * 2.0
     min_dist_sq = min_dist * min_dist
 
-    for _ in range(AGENT_COLLISION_ITERATIONS):
+    for iteration in range(AGENT_COLLISION_ITERATIONS):
+        pairs = _collision_candidate_pairs(agents, min_dist)
+        if not pairs:
+            break
+        if iteration % 2 == 1:
+            pairs.reverse()
+
         moved = False
-        for i, a in enumerate(agents):
-            if not a.is_alive():
+        for i, j in pairs:
+            a = agents[i]
+            b = agents[j]
+            if not a.is_alive() or not b.is_alive():
                 continue
-            for b in agents[i + 1:]:
-                if not b.is_alive():
-                    continue
 
-                delta = b.pos - a.pos
-                dist_sq = delta.length_squared()
-                if dist_sq >= min_dist_sq:
-                    continue
+            delta = b.pos - a.pos
+            dist_sq = delta.length_squared()
+            if dist_sq >= min_dist_sq:
+                continue
 
-                if dist_sq > 1e-8:
-                    dist = math.sqrt(dist_sq)
-                    normal = delta / dist
-                else:
-                    dist = 0.0
-                    normal = pygame.Vector2(1, 0)
+            if dist_sq > 1e-8:
+                dist = math.sqrt(dist_sq)
+                normal = delta / dist
+            else:
+                dist = 0.0
+                normal = pygame.Vector2(1, 0)
 
-                overlap = min_dist - dist
-                correction = normal * (overlap * 0.5)
-                a.pos -= correction
-                b.pos += correction
+            overlap = min_dist - dist
+            correction = normal * (overlap * 0.5)
+            a.pos -= correction
+            b.pos += correction
 
-                a_toward_b = a.vel.dot(normal)
-                if a_toward_b > 0.0:
-                    a.vel -= normal * a_toward_b
+            a_toward_b = a.vel.dot(normal)
+            if a_toward_b > 0.0:
+                a.vel -= normal * a_toward_b
 
-                b_toward_a = b.vel.dot(normal)
-                if b_toward_a < 0.0:
-                    b.vel -= normal * b_toward_a
+            b_toward_a = b.vel.dot(normal)
+            if b_toward_a < 0.0:
+                b.vel -= normal * b_toward_a
 
-                arena.clamp_circle(a.pos, a.vel, AGENT_RADIUS)
-                arena.clamp_circle(b.pos, b.vel, AGENT_RADIUS)
-                moved = True
+            arena.clamp_circle(a.pos, a.vel, AGENT_RADIUS)
+            arena.clamp_circle(b.pos, b.vel, AGENT_RADIUS)
+
+            moved = True
 
         if not moved:
             break
@@ -1594,9 +1795,12 @@ class SimulationStepResult:
     team_setup: TeamSetup
     round_elapsed: float
     last_hit_elapsed: float
+    physics_tick: int
     game_state: str
     summary: str | None = None
     round_finished: bool = False
+    ai_decisions: int = 0
+    ai_batches: int = 0
 
 
 def _simulate_physics_step(
@@ -1608,7 +1812,13 @@ def _simulate_physics_step(
     team_setup: TeamSetup,
     round_elapsed: float,
     last_hit_elapsed: float,
+    physics_tick: int,
 ) -> SimulationStepResult:
+    ai_decisions = 0
+    ai_batches = 0
+    if physics_tick % AI_DECISION_STEPS == 0:
+        ai_decisions, ai_batches = _refresh_neural_policy_actions(agents, arena)
+
     for agent in agents:
         if not agent.is_alive():
             continue
@@ -1619,12 +1829,7 @@ def _simulate_physics_step(
 
     _resolve_agent_collisions(arena, agents)
 
-    hits_before = sum(agent.hits_landed for agent in agents)
-    for attacker in agents:
-        if attacker._fire_hitbox:
-            _resolve_attack(attacker, agents)
-            attacker._fire_hitbox = False
-    if sum(agent.hits_landed for agent in agents) > hits_before:
+    if _resolve_pending_attacks(agents):
         last_hit_elapsed = round_elapsed
 
     for agent in agents:
@@ -1634,9 +1839,20 @@ def _simulate_physics_step(
             _tick_wall_proximity_penalty(agent, arena, PHYSICS_STEP)
 
     round_elapsed += PHYSICS_STEP
+    physics_tick += 1
     reason = _round_end_reason(mode, agents, player, round_elapsed, last_hit_elapsed)
     if reason is None:
-        return SimulationStepResult(player, agents, team_setup, round_elapsed, last_hit_elapsed, "playing")
+        return SimulationStepResult(
+            player,
+            agents,
+            team_setup,
+            round_elapsed,
+            last_hit_elapsed,
+            physics_tick,
+            "playing",
+            ai_decisions=ai_decisions,
+            ai_batches=ai_batches,
+        )
 
     summary = _finish_round(
         trainer,
@@ -1648,15 +1864,39 @@ def _simulate_physics_step(
     if mode == MODE_AI_VS_AI:
         next_setup = _choose_round_setup(mode)
         next_player, next_agents = _make_round_agents(mode, trainer, next_setup)
-        return SimulationStepResult(next_player, next_agents, next_setup, 0.0, 0.0, "playing", summary, True)
+        return SimulationStepResult(
+            next_player,
+            next_agents,
+            next_setup,
+            0.0,
+            0.0,
+            0,
+            "playing",
+            summary,
+            True,
+            ai_decisions,
+            ai_batches,
+        )
 
-    return SimulationStepResult(player, agents, team_setup, round_elapsed, last_hit_elapsed, "game_over", summary, True)
+    return SimulationStepResult(
+        player,
+        agents,
+        team_setup,
+        round_elapsed,
+        last_hit_elapsed,
+        physics_tick,
+        "game_over",
+        summary,
+        True,
+        ai_decisions,
+        ai_batches,
+    )
 
 
 # =============================================================================
 # Main
 # =============================================================================
-def main() -> int:
+def _run_visual() -> int:
     pygame.init()
     screen = pygame.display.set_mode((WIN_W, WIN_H))
     pygame.display.set_caption("Arena Combat")
@@ -1676,18 +1916,20 @@ def main() -> int:
     accumulator = 0.0
     round_elapsed = 0.0
     last_hit_elapsed = 0.0
+    physics_tick = 0
     game_state = "playing"
     last_round_summary = ""
     fast_forward = False
 
     def start_round(next_mode: str) -> None:
-        nonlocal mode, team_setup, player, agents, accumulator, round_elapsed, last_hit_elapsed, game_state, last_round_summary
+        nonlocal mode, team_setup, player, agents, accumulator, round_elapsed, last_hit_elapsed, physics_tick, game_state, last_round_summary
         mode = next_mode
         team_setup = _choose_round_setup(mode)
         player, agents = _make_round_agents(mode, trainer, team_setup)
         accumulator = 0.0
         round_elapsed = 0.0
         last_hit_elapsed = 0.0
+        physics_tick = 0
         game_state = "playing"
         last_round_summary = ""
 
@@ -1735,12 +1977,14 @@ def main() -> int:
                         team_setup,
                         round_elapsed,
                         last_hit_elapsed,
+                        physics_tick,
                     )
                     player = result.player
                     agents = result.agents
                     team_setup = result.team_setup
                     round_elapsed = result.round_elapsed
                     last_hit_elapsed = result.last_hit_elapsed
+                    physics_tick = result.physics_tick
                     game_state = result.game_state
                     if result.summary:
                         last_round_summary = result.summary
@@ -1759,12 +2003,14 @@ def main() -> int:
                         team_setup,
                         round_elapsed,
                         last_hit_elapsed,
+                        physics_tick,
                     )
                     player = result.player
                     agents = result.agents
                     team_setup = result.team_setup
                     round_elapsed = result.round_elapsed
                     last_hit_elapsed = result.last_hit_elapsed
+                    physics_tick = result.physics_tick
                     game_state = result.game_state
                     if result.summary:
                         last_round_summary = result.summary
@@ -1796,6 +2042,137 @@ def main() -> int:
         pygame.display.flip()
 
     return 0
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Arena Combat")
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="run AI-vs-AI training without opening a window or rendering frames",
+    )
+    parser.add_argument(
+        "--headless-rounds",
+        type=int,
+        default=0,
+        help="number of headless rounds to run; 0 means run until interrupted",
+    )
+    parser.add_argument(
+        "--headless-log-every",
+        type=int,
+        default=10,
+        help="log headless training progress every N finished rounds",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="optional random seed for reproducible training runs",
+    )
+    return parser.parse_args(argv)
+
+
+def _run_headless(args: argparse.Namespace) -> int:
+    if args.seed is not None:
+        random.seed(args.seed)
+        torch.manual_seed(args.seed)
+
+    arena = Arena()
+    trainer = EvolutionTrainer()
+    mode = MODE_AI_VS_AI
+    team_setup = _choose_round_setup(mode)
+    player, agents = _make_round_agents(mode, trainer, team_setup)
+    round_elapsed = 0.0
+    last_hit_elapsed = 0.0
+    physics_tick = 0
+
+    rounds_run = 0
+    physics_steps = 0
+    ai_decisions = 0
+    ai_batches = 0
+    started_at = time.perf_counter()
+    last_logged_at = started_at
+    last_logged_steps = 0
+    last_logged_rounds = 0
+
+    max_rounds = max(0, args.headless_rounds)
+    log_every = max(1, args.headless_log_every)
+    print(
+        f"[headless] physics={PHYSICS_HZ}Hz ai={AI_DECISION_HZ}Hz "
+        f"decision_steps={AI_DECISION_STEPS} rounds={'forever' if max_rounds == 0 else max_rounds}",
+        flush=True,
+    )
+
+    try:
+        while max_rounds == 0 or rounds_run < max_rounds:
+            result = _simulate_physics_step(
+                arena,
+                trainer,
+                mode,
+                player,
+                agents,
+                team_setup,
+                round_elapsed,
+                last_hit_elapsed,
+                physics_tick,
+            )
+            player = result.player
+            agents = result.agents
+            team_setup = result.team_setup
+            round_elapsed = result.round_elapsed
+            last_hit_elapsed = result.last_hit_elapsed
+            physics_tick = result.physics_tick
+            physics_steps += 1
+            ai_decisions += result.ai_decisions
+            ai_batches += result.ai_batches
+
+            if not result.round_finished:
+                continue
+
+            rounds_run += 1
+            should_log = (
+                rounds_run % log_every == 0
+                or rounds_run == 1
+                or (result.summary is not None and "evolved" in result.summary)
+                or (max_rounds > 0 and rounds_run >= max_rounds)
+            )
+            if not should_log:
+                continue
+
+            now = time.perf_counter()
+            elapsed = max(1e-6, now - last_logged_at)
+            total_elapsed = max(1e-6, now - started_at)
+            window_steps = physics_steps - last_logged_steps
+            window_rounds = rounds_run - last_logged_rounds
+            steps_per_second = window_steps / elapsed
+            rounds_per_second = window_rounds / elapsed
+            sim_speed = steps_per_second * PHYSICS_STEP
+            avg_batch = ai_decisions / ai_batches if ai_batches else 0.0
+            print(
+                f"[headless] rounds={rounds_run} gen={trainer.generation} "
+                f"eval={trainer.evaluated_this_generation}/{trainer.population_size} "
+                f"best={trainer.best_score:.2f} steps/s={steps_per_second:.0f} "
+                f"sim={sim_speed:.1f}x rounds/s={rounds_per_second:.2f} "
+                f"ai={ai_decisions} decisions/{ai_batches} batches avg_batch={avg_batch:.2f} "
+                f"elapsed={total_elapsed:.1f}s last='{result.summary or ''}'",
+                flush=True,
+            )
+            last_logged_at = now
+            last_logged_steps = physics_steps
+            last_logged_rounds = rounds_run
+    except KeyboardInterrupt:
+        print("[headless] interrupted; saving checkpoint", flush=True)
+    finally:
+        trainer.save()
+
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    if args.headless:
+        return _run_headless(args)
+    return _run_visual()
 
 
 if __name__ == "__main__":
